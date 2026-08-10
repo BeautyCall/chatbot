@@ -65,6 +65,32 @@ curl -s localhost:20128/v1/models | grep -o '"id":"[^"]*"' | head -20
 `.env` pins `LLM_MODEL=gc/gemini-2.5-flash`; that prefix only exists if you connect the same
 provider. Adjust `LLM_MODEL` if you connect different ones.
 
+## 2b. Dashboard access (optional)
+
+The dashboard binds loopback, so it is unreachable remotely by design. Two ways in:
+
+**SSH tunnel** — nothing to configure, and the only reliable route for *adding* providers,
+since OAuth flows redirect to localhost:
+
+```bash
+ssh -L 20128:127.0.0.1:20128 you@staging   # then browse http://localhost:20128/dashboard
+```
+
+**Behind nginx with basic auth** — for routine viewing without a tunnel:
+
+```bash
+sudo apt install apache2-utils
+sudo htpasswd -c /etc/nginx/.htpasswd-9router <username>
+sudo chown www-data:www-data /etc/nginx/.htpasswd-9router
+sudo chmod 640 /etc/nginx/.htpasswd-9router
+sudo cp /opt/slack-bot/deploy/nginx-9router-dashboard.conf /etc/nginx/snippets/9router-dashboard.conf
+# include it in the same HTTPS server{} block as the bot snippet, then:
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+That dashboard holds live provider credentials, so basic auth over TLS is the floor --
+add the IP allowlist in the snippet if your address is stable.
+
 ## 3. The bot
 
 ```bash
