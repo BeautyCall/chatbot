@@ -76,20 +76,16 @@ since OAuth flows redirect to localhost:
 ssh -L 20128:127.0.0.1:20128 you@staging   # then browse http://localhost:20128/dashboard
 ```
 
-**Behind nginx with basic auth** — for routine viewing without a tunnel:
-
-```bash
-sudo apt install apache2-utils
-sudo htpasswd -c /etc/nginx/.htpasswd-9router <username>
-sudo chown www-data:www-data /etc/nginx/.htpasswd-9router
-sudo chmod 640 /etc/nginx/.htpasswd-9router
-sudo cp /opt/slack-bot/deploy/nginx-9router-dashboard.conf /etc/nginx/snippets/9router-dashboard.conf
-# include it in the same HTTPS server{} block as the bot snippet, then:
-sudo nginx -t && sudo systemctl reload nginx
-```
+**Behind nginx on its own hostname** — for routine viewing without a tunnel. Note this
+needs a *dedicated hostname*, not a subpath: 9router's root returns `307 -> /dashboard`
+as an absolute path, so under `location /9router/` the browser leaves the subpath and
+hits the parent site's 404. Full setup steps are in the header of
+`nginx-9router-dashboard.conf`.
 
 That dashboard holds live provider credentials, so basic auth over TLS is the floor --
-add the IP allowlist in the snippet if your address is stable.
+add the IP allowlist in the snippet if your address is stable. Use the SSH tunnel for
+*connecting* providers either way: OAuth callbacks redirect to localhost and will not
+complete over a proxy.
 
 ## 3. The bot
 
