@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import time
 import threading
+import tempfile
 import atexit
 import signal
 from flask import Flask, request, jsonify
@@ -19,9 +20,15 @@ SLACK_SIGNING_SECRET = os.environ["SLACK_SIGNING_SECRET"]
 CS_CHANNEL = os.environ["CS_CHANNEL"]
 BOT_USER_ID = slack.auth_test()["user_id"]
 
-MEMORY_FILE = os.path.join(os.path.dirname(__file__), "memory.json")
+# Runtime state lives in DATA_DIR when set, so a deployed checkout stays
+# read-only and `git pull` never collides with memory.json / bot.log.
+# Falls back to the source directory for local development.
+DATA_DIR = os.getenv("DATA_DIR") or os.path.dirname(__file__)
+os.makedirs(DATA_DIR, exist_ok=True)
 
-LOG_FILE = os.path.join(os.path.dirname(__file__), "bot.log")
+MEMORY_FILE = os.path.join(DATA_DIR, "memory.json")
+
+LOG_FILE = os.path.join(DATA_DIR, "bot.log")
 
 conversation_history: dict[str, list[dict]] = {}
 handoff_done: set[str] = set()
@@ -115,48 +122,140 @@ def buffer_message(user_id: str, channel: str, text: str) -> bool:
 
 # ── Memory helpers ──────────────────────────────────────────────
 
+# Every message does a read-modify-write of the whole file from a daemon
+# thread. Without this lock two concurrent mitra lose each other's updates;
+# without the atomic replace below, a crash mid-write truncates the file and
+# load_memory() silently returns empty -- wiping every CLT correction.
+_memory_lock = threading.RLock()
+
+MAX_HISTORY_PER_USER = 20      # prompt only ever uses the last 10
+HISTORY_RETENTION_DAYS = 30    # drop users idle longer than this
+
+
 def load_memory() -> dict:
     """Load persistent memory from JSON file."""
-    if os.path.exists(MEMORY_FILE):
-        try:
-            with open(MEMORY_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, IOError):
-            pass
-    return {"history": {}, "corrections": []}
+    with _memory_lock:
+        if os.path.exists(MEMORY_FILE):
+            try:
+                with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                data.setdefault("history", {})
+                data.setdefault("corrections", [])
+                data.setdefault("last_seen", {})
+                return data
+            except (json.JSONDecodeError, IOError) as e:
+                log(f"[MEMORY] load failed ({e}) - starting empty")
+        return {"history": {}, "corrections": [], "last_seen": {}}
+
+
+def _prune_memory(data: dict):
+    """Cap per-user history and drop users idle beyond the retention window."""
+    cutoff = time.time() - HISTORY_RETENTION_DAYS * 86400
+    last_seen = data.setdefault("last_seen", {})
+    for uid in list(data.get("history", {})):
+        msgs = data["history"][uid]
+        if len(msgs) > MAX_HISTORY_PER_USER:
+            data["history"][uid] = msgs[-MAX_HISTORY_PER_USER:]
+        if last_seen.get(uid, cutoff + 1) < cutoff:
+            data["history"].pop(uid, None)
+            last_seen.pop(uid, None)
 
 
 def save_memory(data: dict):
-    """Save persistent memory to JSON file."""
-    with open(MEMORY_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    """Atomically persist memory: temp file + os.replace, never a bare open('w')."""
+    with _memory_lock:
+        _prune_memory(data)
+        directory = os.path.dirname(MEMORY_FILE) or "."
+        fd, tmp = tempfile.mkstemp(dir=directory, prefix=".memory.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, MEMORY_FILE)
+        except Exception:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            raise
 
 
 def persist_history(user_id: str):
     """Save user's conversation history to persistent memory."""
+    with _memory_lock:
+        memory = load_memory()
+        memory["history"][user_id] = conversation_history.get(user_id, [])[-MAX_HISTORY_PER_USER:]
+        memory.setdefault("last_seen", {})[user_id] = time.time()
+        save_memory(memory)
+
+
+def restore_history():
+    """Rehydrate conversation_history at boot.
+
+    Previously memory["history"] was written on every message but never read
+    back, so context died on each restart and the stored copy was immediately
+    overwritten with the fresh (empty) in-memory list.
+    """
     memory = load_memory()
-    memory["history"][user_id] = conversation_history.get(user_id, [])
-    save_memory(memory)
+    restored = 0
+    for uid, msgs in memory.get("history", {}).items():
+        if msgs:
+            conversation_history[uid] = list(msgs)[-MAX_HISTORY_PER_USER:]
+            restored += 1
+    if restored:
+        log(f"[MEMORY] restored history for {restored} user(s)")
 
 
 def add_correction(user_question: str, bot_answer: str, corrected: str):
     """Add a correction entry so bot learns from mistakes."""
-    memory = load_memory()
-    memory["corrections"].append({
-        "user_question": user_question,
-        "bot_answer": bot_answer,
-        "corrected": corrected,
-        "timestamp": time.time()
-    })
-    # Keep only last 50 corrections to avoid prompt bloat
-    memory["corrections"] = memory["corrections"][-50:]
-    save_memory(memory)
+    with _memory_lock:
+        memory = load_memory()
+        memory["corrections"].append({
+            "user_question": user_question,
+            "bot_answer": bot_answer,
+            "corrected": corrected,
+            "timestamp": time.time()
+        })
+        # Keep only last 50 corrections to avoid prompt bloat
+        memory["corrections"] = memory["corrections"][-50:]
+        save_memory(memory)
 
 
 def get_corrections_list() -> list:
     """Load corrections list from memory for few-shot injection."""
     memory = load_memory()
     return memory.get("corrections", [])
+
+
+def remove_last_correction() -> dict | None:
+    """Pop the most recent correction (undo for a mis-paired :koreksi:)."""
+    with _memory_lock:
+        memory = load_memory()
+        if not memory.get("corrections"):
+            return None
+        removed = memory["corrections"].pop()
+        save_memory(memory)
+        return removed
+
+
+def _clean_correction(raw: str) -> str:
+    """Strip the [ ] wrapper from the documented `:koreksi: [jawaban]` syntax.
+
+    The README shows brackets as placeholder notation, so CLT types them
+    literally. Only strips when the leading [ closes at the very end, so a
+    reply that genuinely contains brackets is left alone.
+    """
+    text = raw.strip()
+    while len(text) >= 2 and text[0] == "[" and text[-1] == "]":
+        depth = 0
+        for i, ch in enumerate(text):
+            if ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0 and i != len(text) - 1:
+                    return text
+        text = text[1:-1].strip()
+    return text
 
 
 def is_clt(user_id: str) -> bool:
@@ -294,12 +393,15 @@ def _do_process(user_id: str, channel: str, text: str):
                 slack.chat_postMessage(channel=channel, text="❌ Format: `tambah clt @username`")
                 return
             new_uid = match.group(1)
-            memory = load_memory()
-            if new_uid in memory["clt_users"]:
+            with _memory_lock:
+                memory = load_memory()
+                already = new_uid in memory["clt_users"]
+                if not already:
+                    memory["clt_users"].append(new_uid)
+                    save_memory(memory)
+            if already:
                 slack.chat_postMessage(channel=channel, text=f"ℹ️ <@{new_uid}> sudah terdaftar sebagai CLT.")
             else:
-                memory["clt_users"].append(new_uid)
-                save_memory(memory)
                 slack.chat_postMessage(channel=channel, text=f"✅ <@{new_uid}> ditambahkan sebagai CLT.")
             return
 
@@ -313,14 +415,21 @@ def _do_process(user_id: str, channel: str, text: str):
                 slack.chat_postMessage(channel=channel, text="❌ Format: `hapus clt @username`")
                 return
             rem_uid = match.group(1)
-            memory = load_memory()
-            if rem_uid not in memory["clt_users"]:
+            with _memory_lock:
+                memory = load_memory()
+                if rem_uid not in memory["clt_users"]:
+                    outcome = "absent"
+                elif len(memory["clt_users"]) <= 1:
+                    outcome = "last"
+                else:
+                    memory["clt_users"].remove(rem_uid)
+                    save_memory(memory)
+                    outcome = "removed"
+            if outcome == "absent":
                 slack.chat_postMessage(channel=channel, text=f"ℹ️ <@{rem_uid}> tidak terdaftar.")
-            elif len(memory["clt_users"]) <= 1:
+            elif outcome == "last":
                 slack.chat_postMessage(channel=channel, text="❌ Tidak bisa hapus CLT terakhir.")
             else:
-                memory["clt_users"].remove(rem_uid)
-                save_memory(memory)
                 slack.chat_postMessage(channel=channel, text=f"✅ <@{rem_uid}> dihapus dari CLT.")
             return
 
@@ -330,9 +439,11 @@ def _do_process(user_id: str, channel: str, text: str):
                 return
             conversation_history.clear()
             handoff_done.clear()
-            memory = load_memory()
-            memory["history"] = {}
-            save_memory(memory)
+            with _memory_lock:
+                memory = load_memory()
+                memory["history"] = {}
+                memory["last_seen"] = {}
+                save_memory(memory)
             slack.chat_postMessage(
                 channel=channel,
                 text="🗑️ Semua riwayat percakapan & handoff telah di-reset.",
@@ -340,7 +451,7 @@ def _do_process(user_id: str, channel: str, text: str):
             return
 
         # ── Block non-CLT from using CLT-only commands ──
-        clt_only_cmds = ["aktifkan bot", "stats", "list clt", "reset semua"]
+        clt_only_cmds = ["aktifkan bot", "stats", "list clt", "reset semua", "hapus koreksi terakhir"]
         if clean.lower() in clt_only_cmds and not is_clt(user_id):
             return
 
@@ -361,7 +472,7 @@ def _do_process(user_id: str, channel: str, text: str):
         if clean.startswith(":koreksi:"):
             if not is_clt(user_id):
                 return
-            corrected = clean[9:].strip()
+            corrected = _clean_correction(clean[9:])
             if corrected:
                 history = conversation_history.get(user_id, [])
                 last_bot_msg = ""
@@ -373,16 +484,68 @@ def _do_process(user_id: str, channel: str, text: str):
                         last_user_msg = m["content"]
                     if last_bot_msg and last_user_msg:
                         break
+                if not last_user_msg or not last_bot_msg:
+                    log(f"[CORRECTION] user={user_id} REJECTED (no prior Q&A pair)")
+                    slack.chat_postMessage(
+                        channel=channel,
+                        text=(
+                            "⚠️ Koreksi *tidak* tersimpan — belum ada pasangan "
+                            "pertanyaan mitra + jawaban bot untuk dikoreksi.\n"
+                            "Kirim pertanyaannya dulu, tunggu bot menjawab, "
+                            "baru ketik `:koreksi: jawaban yang benar`."
+                        ),
+                    )
+                    return
                 add_correction(
-                    user_question=last_user_msg or "(tidak ada pertanyaan)",
-                    bot_answer=last_bot_msg or "(tidak ada pesan bot sebelumnya)",
-                    corrected=corrected
+                    user_question=last_user_msg,
+                    bot_answer=last_bot_msg,
+                    corrected=corrected,
                 )
-                log(f"[CORRECTION] user={user_id} corrected={corrected[:100]}")
+                log(
+                    f"[CORRECTION] user={user_id} q={last_user_msg[:60]!r} "
+                    f"corrected={corrected[:80]!r}"
+                )
                 slack.chat_postMessage(
                     channel=channel,
-                    text="✅ Koreksi tersimpan! Bot akan belajar dari jawaban ini.",
+                    text=(
+                        "✅ Koreksi tersimpan!\n"
+                        f"• Pertanyaan yang dikoreksi: _{last_user_msg[:200]}_\n"
+                        f"• Jawaban baru: _{corrected[:300]}_\n"
+                        "Kalau pertanyaannya salah, ketik `hapus koreksi terakhir`."
+                    ),
                 )
+            return
+
+        # ── Typo guard: "koreksi:" tanpa titik dua di depan ──
+        if clean.lower().startswith("koreksi:"):
+            if not is_clt(user_id):
+                return
+            log(f"[CORRECTION] user={user_id} REJECTED (missing leading colon)")
+            slack.chat_postMessage(
+                channel=channel,
+                text=(
+                    "⚠️ Koreksi *tidak* tersimpan — perintahnya harus diawali "
+                    "titik dua: `:koreksi: jawaban yang benar`"
+                ),
+            )
+            return
+
+        # ── Undo last correction ──
+        if clean.lower() == "hapus koreksi terakhir":
+            if not is_clt(user_id):
+                return
+            removed = remove_last_correction()
+            if removed:
+                log(f"[CORRECTION] user={user_id} REMOVED q={removed.get('user_question','')[:60]!r}")
+                slack.chat_postMessage(
+                    channel=channel,
+                    text=(
+                        "🗑️ Koreksi terakhir dihapus:\n"
+                        f"• Pertanyaan: _{removed.get('user_question','')[:200]}_"
+                    ),
+                )
+            else:
+                slack.chat_postMessage(channel=channel, text="Belum ada koreksi tersimpan.")
             return
 
         # ── Normal flow ──
@@ -432,9 +595,15 @@ def _do_process(user_id: str, channel: str, text: str):
             return
 
         # Build messages with corrections + call LLM
-        messages = build_messages(
+        messages, rag_meta = build_messages(
             conversation_history[user_id],
-            corrections=get_corrections_list()
+            corrections=get_corrections_list(),
+        )
+        log(
+            f"[RAG] user={user_id} mode={rag_meta['mode']} "
+            f"sections={rag_meta.get('sections')} "
+            f"top={rag_meta.get('top_score')} "
+            f"koreksi={rag_meta.get('corrections_used')}/{rag_meta.get('corrections_total')}"
         )
         reply, usage = chat(messages)
         if usage:
@@ -511,8 +680,28 @@ def slack_events():
     return jsonify({"ok": True})
 
 
-if __name__ == "__main__":
+def notify_shutdown(signum=None, frame=None):
+    log(f"🔴 Bot shutting down (signal={signum})...")
+    try:
+        slack.chat_postMessage(
+            channel=CS_CHANNEL,
+            text="🔴 *Bot CLT Houzcall offline.* Mohon tunggu beberapa saat.",
+        )
+    except Exception:
+        pass
+    if signum:
+        os._exit(0)
+
+
+def _startup():
+    """Boot sequence. Runs at import, not under __main__.
+
+    Under gunicorn the __main__ block never executes, so keeping the startup
+    notification and the signal handlers in there meant they silently stopped
+    working the moment the bot ran behind a real WSGI server.
+    """
     log("🚀 Bot starting up...")
+    restore_history()
     try:
         slack.chat_postMessage(
             channel=CS_CHANNEL,
@@ -521,20 +710,18 @@ if __name__ == "__main__":
     except Exception as e:
         log(f"[WARN] Failed to send startup notification: {e}")
 
-    def notify_shutdown(signum=None, frame=None):
-        log(f"🔴 Bot shutting down (signal={signum})...")
-        try:
-            slack.chat_postMessage(
-                channel=CS_CHANNEL,
-                text="🔴 *Bot CLT Houzcall offline.* Mohon tunggu beberapa saat.",
-            )
-        except Exception:
-            pass
-        if signum:
-            os._exit(0)
-
     atexit.register(notify_shutdown)
-    signal.signal(signal.SIGTERM, notify_shutdown)
-    signal.signal(signal.SIGINT, notify_shutdown)
+    try:
+        signal.signal(signal.SIGTERM, notify_shutdown)
+        signal.signal(signal.SIGINT, notify_shutdown)
+    except ValueError:
+        # Not on the main thread (some WSGI servers import from a worker).
+        log("[WARN] signal handlers not installed (non-main thread)")
+
+
+_startup()
+
+
+if __name__ == "__main__":
 
     app.run(host="0.0.0.0", port=3000, debug=False)

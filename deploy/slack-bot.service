@@ -1,0 +1,50 @@
+[Unit]
+Description=CLT Houzcall Slack bot
+After=network-online.target 9router.service
+Wants=network-online.target
+Requires=9router.service
+
+[Service]
+Type=simple
+User=slackbot
+Group=slackbot
+WorkingDirectory=/opt/slack-bot
+Environment=DATA_DIR=/var/lib/slack-bot
+EnvironmentFile=/opt/slack-bot/.env
+
+# -w 1 is mandatory, not tuning: conversation_history, the debounce Timers,
+# handoff_done and the cooldown map are all in process memory. A second worker
+# gets its own copy and debounce/handoff break. Concurrency comes from threads;
+# the Slack handler returns immediately and works in daemon threads, so the
+# 3-9s LLM call never occupies a request slot.
+ExecStart=/opt/slack-bot/.venv/bin/gunicorn -w 1 --threads 8 -b 127.0.0.1:3000 --timeout 120 app:app
+
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+# --- cgroup limits: cannot starve the rest of staging ---
+# Measured idle footprint is 61 MB / 0.3% CPU; 1.18 ms CPU per message.
+MemoryMax=512M
+CPUQuota=50%
+TasksMax=256
+
+# --- sandboxing ---
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ReadWritePaths=/var/lib/slack-bot
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
