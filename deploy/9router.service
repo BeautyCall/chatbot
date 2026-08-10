@@ -1,0 +1,32 @@
+[Unit]
+Description=9router LLM gateway (loopback only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ninerouter
+Group=ninerouter
+WorkingDirectory=/home/ninerouter
+# Bound to loopback: only the slack-bot on this host can reach it.
+ExecStart=/usr/bin/9router --host 127.0.0.1 --port 20128 --no-browser --skip-update
+
+Restart=always
+RestartSec=10
+
+MemoryMax=1G
+CPUQuota=75%
+TasksMax=512
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ninerouter/.9router
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

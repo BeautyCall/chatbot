@@ -22,3 +22,6 @@ memory.json
 .vscode/
 *.swp
 *~
+
+# Session backups
+*.bak.*

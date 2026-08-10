@@ -2,6 +2,8 @@ from openai import OpenAI
 import os
 from dotenv import load_dotenv
 
+import retrieval
+
 
 # Load .env from the same directory as this file
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
@@ -105,32 +107,20 @@ Di akhir setiap jawaban tambahkan: "_Ketik *hubungi CLT* jika ingin terhubung de
 Gunakan Slack markdown: bold pakai *teks*, italic pakai _teks_, list pakai bullet •"""
 
 
-def _build_context_message(now, corrections: list | None) -> dict:
-    """Dynamic context kept out of system prompt so Gemini can cache the static SOP prefix."""
-    hari = ["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu"][now.weekday()]
-    tanggal = now.strftime("%d/%m/%Y")
-    jam = now.strftime("%H:%M")
-    waktu_bagian = "pagi" if now.hour < 11 else "siang" if now.hour < 15 else "sore" if now.hour < 18 else "malam"
+def build_messages(
+    history: list[dict],
+    corrections: list = None,
+    query: str = None,
+) -> tuple[list[dict], dict]:
+    """Build messages array for LLM call. Returns (messages, retrieval_meta).
 
-    parts = [
-        f"*WAKTU SEKARANG:* {hari}, {tanggal}, jam {jam} WIB ({waktu_bagian})",
-    ]
-    if corrections:
-        parts.append("*OVERRIDE SOP — Jawaban yang BENAR untuk pertanyaan berikut:*")
-        for c in corrections[-5:]:
-            parts.append(f"- Jika mitra bertanya tentang: \"{c['user_question']}\"")
-            parts.append(f"  Maka jawab: \"{c['corrected']}\"")
-
-    return {"role": "user", "content": "\n".join(parts)}
-
-
-def build_messages(history: list[dict], corrections: list = None) -> list[dict]:
-    """
-    Build messages array for LLM call.
-    - Static SOP stays in system role for Gemini implicit context caching
-    - Dynamic time/corrections go in a separate user message (not in system prefix)
-    - Truncates history to last 10 messages
-    - Injects reminder per turn to prevent role drift
+    - The system prompt carries only the SOP sections relevant to `query`;
+      below the confidence threshold it falls back to the full SOP.
+    - Corrections are selected by relevance, not recency, and placed in the
+      trailing message with explicit precedence over the SOP. Previously they
+      sat before the history while the closing reminder said "ikuti SOP", so
+      the SOP won and CLT corrections appeared not to take effect.
+    - History is truncated to the last 10 messages.
     """
     from datetime import datetime, timezone, timedelta
 
@@ -140,22 +130,42 @@ def build_messages(history: list[dict], corrections: list = None) -> list[dict]:
     jam = now.strftime("%H:%M")
     waktu_bagian = "pagi" if now.hour < 11 else "siang" if now.hour < 15 else "sore" if now.hour < 18 else "malam"
 
-    recent = history[-10:] if len(history) > 10 else history
-    reminder = {
-        "role": "user",
-        "content": (
-            f"Ingat! Kamu CLT Houzcall. Ikuti SOP. Jawab singkat & ramah. "
-            f"WAJIB mulai jawaban dengan sapaan Baik Mba/Mas. Jangan jawab pertanyaan di luar SOP. "
-            f"Hari ini {hari}, {tanggal}, jam {jam} WIB ({waktu_bagian})."
-        ),
-    }
+    if query is None:
+        query = next(
+            (m["content"] for m in reversed(history) if m.get("role") == "user"),
+            "",
+        )
 
-    msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
-    if corrections:
-        msgs.append(_build_context_message(now, corrections))
+    sop_text, meta = retrieval.build_sop(SYSTEM_PROMPT, query)
+    picked = retrieval.select_corrections(query, corrections or [])
+    meta["corrections_used"] = len(picked)
+    meta["corrections_total"] = len(corrections or [])
+
+    recent = history[-10:] if len(history) > 10 else history
+
+    tail = [f"*WAKTU SEKARANG:* {hari}, {tanggal}, jam {jam} WIB ({waktu_bagian})"]
+    if picked:
+        tail.append("")
+        tail.append(
+            "*KOREKSI CLT — WAJIB DIIKUTI. Jika bertentangan dengan SOP, "
+            "IKUTI KOREKSI INI, bukan SOP:*"
+        )
+        for c in picked:
+            tail.append(f'- Jika mitra bertanya tentang: "{c["user_question"]}"')
+            tail.append(f'  Jawab: "{c["corrected"]}"')
+    tail.append("")
+    tail.append(
+        "Ingat! Kamu CLT Houzcall. Ikuti SOP di atas"
+        + (" kecuali ada KOREKSI CLT di atas yang lebih diutamakan" if picked else "")
+        + ". Jawab singkat & ramah. WAJIB mulai jawaban dengan sapaan Baik Mba/Mas. "
+        "Jangan jawab pertanyaan di luar SOP. "
+        f"Hari ini {hari}, {tanggal}, jam {jam} WIB ({waktu_bagian})."
+    )
+
+    msgs = [{"role": "system", "content": sop_text}]
     msgs.extend(recent)
-    msgs.append(reminder)
-    return msgs
+    msgs.append({"role": "user", "content": "\n".join(tail)})
+    return msgs, meta
 
 
 def _extract_usage(response) -> dict | None:
