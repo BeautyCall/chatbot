@@ -8,8 +8,15 @@ Type=simple
 User=ninerouter
 Group=ninerouter
 WorkingDirectory=/home/ninerouter
-# Bound to loopback: only the slack-bot on this host can reach it.
-ExecStart=/usr/bin/9router --host 127.0.0.1 --port 20128 --no-browser --skip-update
+
+# 9router bundles Next.js 16, which requires Node >=20.9 -- its own
+# package.json engines field says >=18 and is stale. This uses a Node kept in
+# the ninerouter home so the system /usr/bin/node (used by other services'
+# asset pipeline) is never touched. cli.js is invoked directly rather than via
+# the bin shim so the correct interpreter is guaranteed.
+ExecStart=/home/ninerouter/nodejs/bin/node \
+          /home/ninerouter/.npm-global/lib/node_modules/9router/cli.js \
+          --host 127.0.0.1 --port 20128 --no-browser --skip-update
 
 Restart=always
 RestartSec=10

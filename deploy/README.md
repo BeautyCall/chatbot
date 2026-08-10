@@ -21,12 +21,27 @@ sudo chmod 750 /var/lib/slack-bot
 
 ## 2. 9router
 
-Needs Node >= 18.
+**Needs Node >= 20.9**, not 18. The package's `engines` field says `>=18.0.0` but is
+stale: it bundles Next.js 16.2.1, which requires `>=20.9.0`. Give `ninerouter` its own
+Node so the system one (used by other services) is untouched.
 
 ```bash
-sudo npm install -g 9router
+# Node, private to the ninerouter user
+sudo -u ninerouter bash -c '
+  ARCH=$(uname -m); case "$ARCH" in x86_64) A=x64;; aarch64) A=arm64;; *) echo "unsupported: $ARCH"; exit 1;; esac
+  cd ~ && curl -fsSLO "https://nodejs.org/dist/v22.11.0/node-v22.11.0-linux-$A.tar.xz" &&
+  tar -xJf node-v22.11.0-linux-$A.tar.xz && mv node-v22.11.0-linux-$A nodejs &&
+  rm node-v22.11.0-linux-$A.tar.xz && ~/nodejs/bin/node --version'
+
+# 9router into a per-user npm prefix (never /usr/local)
+sudo -u ninerouter bash -c '
+  export PATH=$HOME/nodejs/bin:$PATH
+  npm config set prefix ~/.npm-global
+  npm install -g 9router'
+
 sudo install -m644 /opt/slack-bot/deploy/9router.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now 9router
+systemctl status 9router --no-pager | head -5
 ```
 
 **Connect providers** — the dashboard is a web UI, so tunnel to it from your Mac:
@@ -49,6 +64,32 @@ curl -s localhost:20128/v1/models | grep -o '"id":"[^"]*"' | head -20
 
 `.env` pins `LLM_MODEL=gc/gemini-2.5-flash`; that prefix only exists if you connect the same
 provider. Adjust `LLM_MODEL` if you connect different ones.
+
+## 2b. Dashboard access (optional)
+
+The dashboard binds loopback, so it is unreachable remotely by design. Two ways in:
+
+**SSH tunnel** — nothing to configure, and the only reliable route for *adding* providers,
+since OAuth flows redirect to localhost:
+
+```bash
+ssh -L 20128:127.0.0.1:20128 you@staging   # then browse http://localhost:20128/dashboard
+```
+
+**Behind nginx with basic auth** — for routine viewing without a tunnel:
+
+```bash
+sudo apt install apache2-utils
+sudo htpasswd -c /etc/nginx/.htpasswd-9router <username>
+sudo chown www-data:www-data /etc/nginx/.htpasswd-9router
+sudo chmod 640 /etc/nginx/.htpasswd-9router
+sudo cp /opt/slack-bot/deploy/nginx-9router-dashboard.conf /etc/nginx/snippets/9router-dashboard.conf
+# include it in the same HTTPS server{} block as the bot snippet, then:
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+That dashboard holds live provider credentials, so basic auth over TLS is the floor --
+add the IP allowlist in the snippet if your address is stable.
 
 ## 3. The bot
 
